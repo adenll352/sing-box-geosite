@@ -1,5 +1,8 @@
 name: Config Update
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main ]
@@ -12,54 +15,86 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        persist-credentials: true
+
     - name: "Setup sing-box"
       env:
         SING_BOX_DEB_URL: "https://github.com/SagerNet/sing-box/releases/download/v1.10.0-alpha.27/sing-box_1.10.0-alpha.27_linux_amd64.deb"
       run: |
-          set -Eeuo pipefail
-          wget -O sing-box.deb $SING_BOX_DEB_URL
-          sudo dpkg -i sing-box.deb
+        set -Eeuo pipefail
+        wget -O sing-box.deb $SING_BOX_DEB_URL
+        sudo dpkg -i sing-box.deb
+
     - name: Set up Python3
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v4
       with:
         python-version: 3.x
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pandas requests pyyaml
+
     - name: Download content
       run: |
         URL="https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/BaseFilter/sections/adservers.txt"
         OUTPUT_FILE="./rule/adservers.txt"
-
         curl -L $URL -o $OUTPUT_FILE
-
         if [ -f "$OUTPUT_FILE" ]; then
           echo "Download successful: $OUTPUT_FILE"
         else
           echo "Download failed."
           exit 1
         fi
+
     - name: Convert AdGuard DNS Filter to sing-box rule set
       run: |
         sing-box rule-set convert --type adguard --output ./rule/adservers.srs ./rule/adservers.txt
+
     - name: Run script
       run: python ../main.py
       working-directory: ./rule/
-    - name: Commit and push config.json
+
+    - name: Show git status (debug)
       run: |
+        git status --porcelain=v1 || true
+        git --no-pager diff --name-only || true
+
+    - name: Commit and push generated rules
+      env:
+        REPO_PUSH_PAT: ${{ secrets.REPO_PUSH_PAT }}
+      run: |
+        set -euo pipefail
         git config --global user.email "action@github.com"
         git config --global user.name "GitHub Action"
-        git add ./rule/*.json
-        git add ./rule/*.srs
-        git add ./rule/*.txt
 
-        # 检查是否有文件被修改
+        # Use the PAT stored in secrets for pushing (do not echo the token)
+        git remote set-url origin "https://x-access-token:${REPO_PUSH_PAT}@github.com/${{ github.repository }}"
+
+        # Stage files (tolerate no matches)
+        git add ./rule/*.json || true
+        git add ./rule/*.srs || true
+        git add ./rule/*.txt || true
+
+        # 如果没有 staged 变更，则退出
         if git diff --staged --quiet; then
           echo "No changes to commit"
           exit 0
-        else
-          git commit -m "Update rules"
-          git push
         fi
+
+        git commit -m "Update rules"
+
+        # 拉取远端最新并 rebase（避免非 fast-forward）
+        git fetch origin main
+        if git rev-parse --verify origin/main >/dev/null 2>&1; then
+          git pull --rebase origin main || {
+            echo "Rebase failed; aborting. Please inspect logs and resolve conflicts manually."
+            exit 1
+          }
+        fi
+
+        git push origin main
